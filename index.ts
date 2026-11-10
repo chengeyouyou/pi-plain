@@ -199,10 +199,17 @@ class PlainTextDialog extends VStack {
 	private done: DoneFn;
 	private closed = false;
 	private contentText: Text;
-	private scrollView: ScrollView;
+	private scrollView: ScrollView | undefined;
 	private statusText: Text;
 	private statusMsg = "";
-
+	/** 布局根切换状态（F1）：dialog 自己持有 previousRoot，done/dispose 任一路径都能幂等恢复 */
+	private previousRoot: Component | undefined;
+	private swapped = false;
+	private restored = false;
+	/** 上一次同步 scroll 尺寸时的终端行数（F3 resize 自适应） */
+	private lastRows: number | undefined;
+	/** resize 后延迟刷新状态行的定时器（等本帧布局完成后 viewportHeight 才更新） */
+	private statusTimer: ReturnType<typeof setTimeout> | undefined;
 	constructor(text: string, tui: TUI, theme: Theme, done: DoneFn) {
 		super([]);
 		this.text = text;
@@ -210,22 +217,90 @@ class PlainTextDialog extends VStack {
 		this.theme = theme;
 		this.done = done;
 		this.contentText = new Text(stripTerminalSequences(text), 1, 0);
-		this.scrollView = new ScrollView(this.contentText, {
-			follow: "end",
-			scrollbar: "always",
-		});
-		this.addChild(this.scrollView, {
-			// 数字 basis：dialog 是布局根，帧高 = 终端行数；
-			// grow:1 让 ScrollView 填满编辑区，状态行占 1 行。
-			basis: Math.max(1, this.rows() - 3),
-			grow: 1,
-			shrink: 1,
-			minSize: 1,
-			maxSize: Math.max(1, this.rows() - 3),
-		});
+		if (isViewportTUI(tui)) {
+			// 全屏模式：ScrollView 成为布局帧里的真正滚动节点
+			this.scrollView = new ScrollView(this.contentText, {
+				follow: "end",
+				scrollbar: "always",
+			});
+			this.addChild(this.scrollView, {
+				// 数字 basis：dialog 是布局根，帧高 = 终端行数；
+				// grow:1 让 ScrollView 填满编辑区，状态行占 1 行（F3 时按真实状态行高度修正）。
+				basis: Math.max(1, this.rows() - 3),
+				grow: 1,
+				shrink: 1,
+				minSize: 1,
+				maxSize: Math.max(1, this.rows() - 3),
+			});
+		} else {
+			// regular 模式：ScrollView 在普通 Container 里拿不到 viewport（无限高测量、
+			// 渲染不裁剪、滚动键无效），降级为整段纯文本渲染
+			this.addChild(this.contentText);
+		}
 		this.statusText = new Text("", 0, 0);
 		this.addChild(this.statusText);
 		this.updateStatus();
+		this.lastRows = this.rows();
+	}
+
+	/** 全屏模式：保存原布局根并把 dialog 设为布局根（非全屏/已切换时 no-op）。 */
+	takeoverLayout(tui: TUI): void {
+		if (!this.swapped && isViewportTUI(tui)) {
+			// layoutRoot 是 TuiAltScreen 私有字段，公开 API 无 getter
+			this.previousRoot = (tui as unknown as { layoutRoot?: Component }).layoutRoot;
+			// F3：hook requestRender 检测终端 resize（pi 的 resize 监听器只调 tui.requestRender，
+			// 而布局根经 [LAYOUT_NODE] 结构测量，dialog 自己的 render() 每帧不会被调）
+			const tuiAny = tui as unknown as { __plainRequestRender?: (force?: boolean) => void };
+			if (!tuiAny.__plainRequestRender) {
+				tuiAny.__plainRequestRender = this.tui.requestRender.bind(this.tui);
+			}
+			this.tui.requestRender = (force?: boolean) => {
+				if (this.swapped) this.syncScrollSize();
+				return tuiAny.__plainRequestRender!(force);
+			};
+			tui.setLayoutRoot(this);
+			this.swapped = true;
+		}
+	}
+
+	/** 恢复原布局根；done() 与 dispose() 可能先后/单独调用，靠 swapped/restored 保证幂等。 */
+	restoreLayout(): void {
+		if (this.swapped && !this.restored && isViewportTUI(this.tui)) {
+			// F3：还原 requestRender 为原始函数并清除共享槽
+			const tuiAny = this.tui as unknown as { __plainRequestRender?: (force?: boolean) => void };
+			if (tuiAny.__plainRequestRender) {
+				this.tui.requestRender = tuiAny.__plainRequestRender;
+				tuiAny.__plainRequestRender = undefined;
+			}
+			this.tui.setLayoutRoot(this.previousRoot);
+			this.restored = true;
+		}
+	}
+
+	/** 终端行数变化时重算 scroll 条目的 basis/maxSize（entries 是 Stack 的真实可变成员）。 */
+	private syncScrollSize(): void {
+		const rows = this.rows();
+		if (rows === this.lastRows) return;
+		this.lastRows = rows;
+		const width = Math.max(1, this.tui.terminal?.columns ?? 80);
+		const statusH = Math.max(1, this.statusText.render(width).length);
+		// 状态行至少保留 1 行，scroll 框不得占满整个帧
+		const size = Math.min(Math.max(1, rows - statusH), Math.max(1, rows - 1));
+		const entry = this.entries.find((e) => e.component === this.scrollView);
+		if (entry) {
+			entry.basis = size;
+			entry.maxSize = size;
+		}
+		// 状态行显示 viewportHeight，本帧布局完成后才更新，延迟一拍刷新
+		if (this.statusTimer) clearTimeout(this.statusTimer);
+		this.statusTimer = setTimeout(() => {
+			this.statusTimer = undefined;
+			if (this.swapped && !this.closed) {
+				this.updateStatus();
+				this.requestRender();
+			}
+		}, 0);
+		this.statusTimer.unref?.();
 	}
 
 	private rows(): number {
@@ -247,10 +322,14 @@ class PlainTextDialog extends VStack {
 
 	private updateStatus(): void {
 		const msg = this.statusMsg ? `  ${this.statusMsg}` : "";
-		const viewport = this.scrollView.viewportHeight;
-		const total = this.totalLines();
-		const pos = Math.min(this.scrollView.scrollTop + viewport, total);
-		const line = ` 行 ${pos}/${total} · c=复制全部 w=存文件 g/G=首/尾 q=关闭${msg}`;
+		const line = this.scrollView
+			? (() => {
+					const viewport = this.scrollView!.viewportHeight;
+					const total = this.totalLines();
+					const pos = Math.min(this.scrollView!.scrollTop + viewport, total);
+					return ` 行 ${pos}/${total} · c=复制全部 w=存文件 g/G=首/尾 q=关闭${msg}`;
+				})()
+			: `完整纯文本 · c=复制全部 w=存文件 q=关闭${msg}`;
 		this.statusText.setText(this.theme.fg("dim", line));
 		this.statusMsg = "";
 	}
@@ -264,19 +343,20 @@ class PlainTextDialog extends VStack {
 			return;
 		}
 
-		const viewport = this.scrollView.viewportHeight;
+		// regular 模式无 ScrollView，滚动键为 no-op
+		const viewport = this.scrollView?.viewportHeight ?? 0;
 		if (matchesKey(data, "pageUp")) {
-			this.scrollView.scrollBy(-Math.max(1, viewport - 1));
+			this.scrollView?.scrollBy(-Math.max(1, viewport - 1));
 		} else if (matchesKey(data, "pageDown")) {
-			this.scrollView.scrollBy(Math.max(1, viewport - 1));
+			this.scrollView?.scrollBy(Math.max(1, viewport - 1));
 		} else if (matchesKey(data, "space")) {
-			this.scrollView.scrollBy(Math.max(1, viewport - 1));
+			this.scrollView?.scrollBy(Math.max(1, viewport - 1));
 		} else if (matchesKey(data, "b")) {
-			this.scrollView.scrollBy(-Math.max(1, Math.floor(viewport / 2)));
+			this.scrollView?.scrollBy(-Math.max(1, Math.floor(viewport / 2)));
 		} else if (matchesKey(data, "g")) {
-			this.scrollView.scrollToStart();
+			this.scrollView?.scrollToStart();
 		} else if (matchesKey(data, "shift+g")) {
-			this.scrollView.scrollToEnd();
+			this.scrollView?.scrollToEnd();
 		} else if (matchesKey(data, "c")) {
 			void (async () => {
 				try {
@@ -317,6 +397,17 @@ class PlainTextDialog extends VStack {
 	invalidate(): void {
 		this.contentText.invalidate();
 		this.statusText.invalidate();
+	}
+
+	dispose(): void {
+		// pi 的 resetExtensionUI（/reload、切换会话）不走 done() 直接 dispose：
+		// 这里必须恢复布局根，否则 layoutRoot 停留在已卸载的 dialog 上，界面永久冻结
+		this.restoreLayout();
+		if (this.statusTimer) {
+			clearTimeout(this.statusTimer);
+			this.statusTimer = undefined;
+		}
+		/* 无定时器/订阅 */
 	}
 
 	private close(): void {
@@ -361,19 +452,12 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				await ctx.ui.custom((tui, theme, _keybindings, done) => {
-					// 全屏模式的 tui 实现了 ViewportTUI：把 dialog 设为布局根，
-					// 其 ScrollView 才能成为布局帧里的真正滚动节点（否则挂在普通
-					// Container 里，viewport 恒为 0，滚轮/翻页/选择全部失效）。
 					const viewport = isViewportTUI(tui);
-					// layoutRoot 是 TuiAltScreen 私有字段，公开 API 无 getter，读一次保存
-					const previousRoot = viewport
-						? (tui as unknown as { layoutRoot?: Component }).layoutRoot
-						: undefined;
 					const dialog = new PlainTextDialog(text, tui, theme, () => {
-						if (viewport) tui.setLayoutRoot(previousRoot);
+						if (viewport) dialog.restoreLayout();
 						done();
 					});
-					if (viewport) tui.setLayoutRoot(dialog);
+					if (viewport) dialog.takeoverLayout(tui);
 					return dialog;
 				});
 			} catch (error) {

@@ -3,10 +3,9 @@
  *
  * 用法: node test/run-tests.mjs
  *
- * 测试：
- *  1. 单元: buildPlainLines / buildPlainHeader / writeTempFile
- *     （会话条目 → 纯文本行：无 ANSI、角色分隔、工具调用/结果、错误标记）
- *  2. 集成: 真实 TuiAltScreen + 假终端 + 生产忠实布局
+ * 测试三层：
+ *  1. buildPlainLines: 会话条目 → 纯文本行（无 ANSI、结构正确）
+ *  2. writeTempFile / buildPlainHeader
  *  3. 集成测试: 真实 TuiAltScreen + 假终端 + 生产忠实布局
  *     复刻 chat-viewport.js 的真实树 (root → dock → editorContainer)，
  *     像 pi 一样 editorContainer.addChild(dialog) 挂载，验证 index.ts 里
@@ -409,6 +408,159 @@ assert(tui.layoutRoot === previousRoot, "layoutRoot 恢复为原 root");
 tui.renderNow(true);
 assert(!!getScrollViewBox(tui.currentLayout, transcript), "关闭后 currentLayout 里能找到 transcript 的 scroll 框");
 assert(tui.getFocusedComponent() === editor, "关闭后 focus 回到 editor");
+
+// --- T1: dispose 路径（pi resetExtensionUI 不走 done()）必须恢复 layoutRoot ---
+doneCalled = 0;
+dialog = undefined;
+await registeredDef.handler("", fakeCtx);
+dialog = editorContainer.children[0];
+assert(tui.layoutRoot === dialog, "T1: 新 dialog 已 swap 为 layoutRoot");
+const t1Prev = dialog.previousRoot;
+assert(t1Prev === previousRoot, "T1: dialog.previousRoot 记录了原布局根");
+dialog.dispose(); // 模拟 resetExtensionUI：无 done 直接 dispose
+assert(tui.layoutRoot === t1Prev, "T1: dispose 后 layoutRoot 恢复为原 root");
+tui.renderNow(true);
+assert(!!getScrollViewBox(tui.currentLayout, transcript), "T1: dispose 后 currentLayout 里能找到 transcript 的 scroll 框");
+const t1AfterFirstDispose = tui.layoutRoot;
+dialog.dispose(); // 第二次 dispose 必须幂等
+assert(tui.layoutRoot === t1AfterFirstDispose, "T1: 重复 dispose 幂等（layoutRoot 不变）");
+
+// --- T2: done 之后再 dispose（pi 正常时序）必须 no-op ---
+doneCalled = 0;
+dialog = undefined;
+await registeredDef.handler("", fakeCtx);
+dialog = editorContainer.children[0];
+assert(tui.layoutRoot === dialog, "T2: 新 dialog 已 swap 为 layoutRoot");
+const t2Prev = dialog.previousRoot;
+assert(t2Prev === previousRoot, "T2: dialog.previousRoot 记录了原布局根");
+terminal.feed("q");
+assert(doneCalled === 1, "T2: q 关闭对话框 (done 被调用)");
+assert(tui.layoutRoot === t2Prev, "T2: done 已恢复 layoutRoot");
+tui.renderNow(true);
+dialog.dispose(); // pi 在 done 之后还会调 component.dispose()
+assert(tui.layoutRoot === t2Prev, "T2: done 后再 dispose 幂等 no-op（layoutRoot 不变）");
+
+// --- T4: 终端 resize 时 scroll 框自适应（F3） ---
+doneCalled = 0;
+dialog = undefined;
+await registeredDef.handler("", fakeCtx);
+dialog = editorContainer.children[0];
+assert(tui.layoutRoot === dialog, "T4: 新 dialog 已 swap 为 layoutRoot");
+tui.renderNow(true);
+const t4Scroll = dialog.children[0];
+const t4vhBefore = t4Scroll.viewportHeight;
+const t4posBefore = Math.min(t4Scroll.scrollTop + t4Scroll.viewportHeight, 200);
+assert(t4vhBefore > 0, `T4: resize 前 viewportHeight > 0 (实际 ${t4vhBefore})`);
+terminal.rows = 45; // 30 → 45
+tui.requestRender(); // pi 的 resize 监听器走 tui.requestRender
+tui.renderNow(true);
+const t4vhAfter = t4Scroll.viewportHeight;
+assert(t4vhAfter > t4vhBefore, `T4: resize 后 viewportHeight 增大 (${t4vhBefore} → ${t4vhAfter})`);
+await new Promise((r) => setTimeout(r, 80)); // 等状态行延迟一拍刷新
+tui.renderNow(true);
+const t4status = dialog.children[1].text ?? "";
+// follow:"end" 下 resize 后 pos 仍应是新末行（208），而不是旧的 174（173+1，resize 前 27 高的末行）
+assert(
+	t4status.includes("行 208/") && !t4status.includes(`行 ${t4posBefore}/`),
+	`T4: 状态行反映新 viewport (旧值 行 ${t4posBefore}/ 已不存在; 实际: ${JSON.stringify(t4status)})`
+);
+terminal.rows = ROWS;
+tui.requestRender();
+tui.renderNow(true);
+terminal.feed("q"); // 关 T4 dialog，避免 focus/布局根残留影响后续测试
+assert(doneCalled === 1, "T4: q 关闭 dialog");
+assert(tui.layoutRoot === previousRoot, "T4: 关闭后 layoutRoot 恢复");
+
+// --- Esc 关闭（新实例） ---
+doneCalled = 0;
+dialog = undefined;
+await registeredDef.handler("", fakeCtx);
+dialog = editorContainer.children[0];
+assert(tui.layoutRoot === dialog, "新 dialog 再次 swap 为 layoutRoot");
+assert(doneCalled === 0, "新 dialog 初始未关闭");
+tui.renderNow(true);
+tui.setFocus(dialog);
+terminal.feed("\x1b");
+assert(doneCalled === 1, "Esc 关闭对话框");
+assert(tui.layoutRoot === previousRoot, "Esc 关闭后 layoutRoot 再次恢复");
+tui.renderNow(true);
+assert(!!getScrollViewBox(tui.currentLayout, transcript), "Esc 关闭后 transcript scroll 框重新可见");
+assert(tui.getFocusedComponent() === editor, "Esc 关闭后 focus 回到 editor");
+
+// --- T3: 堆叠对话框（dialog1 未关时再开 dialog2） ---
+// 说明: 每次 fakeUi.custom 都会 clear() 重挂 editorContainer，且 close 闭包共享 doneCalled 计数器；
+// 因此每次 handler 前把 doneCalled 归零（该次 close 只会被调一次），
+// 再手工把 dialog1 挂回 dialog2 之下模拟 pi 的堆叠布局（测试重点是 layoutRoot 捕获/恢复链）
+doneCalled = 0;
+await registeredDef.handler("", fakeCtx);
+const dialog1 = factoryLast;
+assert(tui.layoutRoot === dialog1, "T3: dialog1 swap 为 layoutRoot");
+doneCalled = 0;
+await registeredDef.handler("", fakeCtx);
+const dialog2 = factoryLast;
+assert(dialog2 !== dialog1, "T3: dialog2 是新实例");
+assert(tui.layoutRoot === dialog2, "T3: dialog2 swap 后 layoutRoot === dialog2");
+assert(dialog2.previousRoot === dialog1, "T3: dialog2.previousRoot 捕获为 dialog1（堆叠）");
+// 手工恢复堆叠布局：dialog1 在 editorContainer 下、dialog2 在上、dialog2 获焦
+editorContainer.clear();
+editorContainer.addChild(dialog1);
+editorContainer.addChild(dialog2);
+tui.setFocus(dialog2);
+tui.requestRender();
+tui.renderNow(true);
+terminal.feed("q"); // 关 dialog2
+assert(doneCalled === 1, "T3: dialog2 的 done 被调用");
+assert(tui.layoutRoot === dialog1, "T3: 关 dialog2 后 layoutRoot 恢复为 dialog1");
+tui.renderNow(true);
+// close 闭包把 focus 还给 editor，重新聚焦 dialog1 以便第二次 q 生效
+doneCalled = 0;
+tui.setFocus(dialog1);
+tui.renderNow(true);
+terminal.feed("q"); // 关 dialog1
+assert(doneCalled === 1, "T3: dialog1 的 done 被调用");
+assert(tui.layoutRoot === previousRoot, "T3: 关 dialog1 后 layoutRoot 恢复为原 root");
+tui.renderNow(true);
+assert(!!getScrollViewBox(tui.currentLayout, transcript), "T3: transcript scroll 框重新可见");
+assert(tui.getFocusedComponent() === editor, "T3: focus 回到 editor");
+
+// --- T5: regular 模式（非 ViewportTUI）降级为完整纯文本 ---
+const regularUi = {
+	custom: async (factory) => {
+		const close = () => {
+			if (t5Done > 0) return;
+			t5Done++;
+		};
+		const component = factory(fakeTui, themeLike, { matches: () => false }, close);
+		regularUi.__last = component;
+		return component;
+	},
+	notify: (msg) => notifications.push(msg),
+};
+let t5Done = 0;
+const fakeTui = {
+	terminal: { rows: 30, columns: COLS },
+	requestRender: () => {},
+	setLayoutRoot: () => {
+		t5SetLayoutRootCalled = true;
+	},
+};
+let t5SetLayoutRootCalled = false;
+assert(isViewportTUI(fakeTui) === false, "T5: 导出的 isViewportTUI 守卫对无 symbol 的假 tui 返回 false");
+const t5RootBefore = tui.layoutRoot;
+await registeredDef.handler("", { mode: "tui", ui: regularUi, sessionManager: fakeCtx.sessionManager, hasUI: true });
+const t5Dialog = regularUi.__last;
+assert(!!t5Dialog, "T5: regular 分支返回了 dialog 组件");
+assert(t5SetLayoutRootCalled === false, "T5: regular 模式不调用 setLayoutRoot");
+assert(tui.layoutRoot === t5RootBefore, "T5: 原 layoutRoot 未被触碰");
+const t5Lines = t5Dialog.render(COLS);
+assert(t5Lines.join("\n").includes("plain-line-"), "T5: regular dialog 渲染出纯会话内容（无滚动裁剪）");
+assert(t5Dialog.scrollView === undefined, "T5: regular 分支不创建 ScrollView");
+assert((t5Dialog.children[1].text ?? "").includes("完整纯文本"), "T5: 状态行是 '完整纯文本' 而非 '行 pos/total'");
+t5Dialog.handleInput("c");
+await new Promise((r) => setTimeout(r, 1500));
+assert(/剪贴板|失败/.test(t5Dialog.children[1].text ?? ""), "T5: c 复制全部纯文本仍可用");
+t5Dialog.handleInput("q");
+assert(t5Done === 1, "T5: q 关闭对话框 (done 被调用)");
 
 tui.stop();
 
