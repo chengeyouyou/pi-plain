@@ -1,8 +1,12 @@
-# /plain — pi 会话纯文本视图
+# pi-plain — pi 会话纯文本视图扩展
+
+> 仓库：[chengeyouyou/pi-plain](https://github.com/chengeyouyou/pi-plain)
 
 把当前 pi 会话窗口渲染成**无格式纯文本**，方便鼠标选择复制。
 参考了 Claude Code 的 transcript 模式（`Ctrl+o`）与 Codex CLI 的 `/copy`/`/export` 的思路，
 并复用 pi 自带的选中复制通道（本地 / WSL / SSH 均可用）。
+
+设计与开发过程详见 [docs/development.md](docs/development.md)。
 
 ## 功能
 
@@ -50,21 +54,26 @@ transcript/编辑器/焦点随之复原。若不做这一步，对话框会被 p
 
 ## 安装
 
-已安装到全局自动发现目录，重启 pi（或 `/reload`）后生效：
-
-```
-~/.pi/agent/extensions/plain/index.ts
-```
-
-其他安装方式：
+### 从本仓库安装
 
 ```bash
+# 全局（推荐，自动发现目录）
+mkdir -p ~/.pi/agent/extensions/plain
+git clone --depth 1 https://github.com/chengeyouyou/pi-plain /tmp/pi-plain
+cp /tmp/pi-plain/index.ts ~/.pi/agent/extensions/plain/index.ts
+rm -rf /tmp/pi-plain
+
 # 项目级（信任项目后生效）
 mkdir -p .pi/extensions/plain
 cp index.ts .pi/extensions/plain/index.ts
+```
 
-# 或临时加载单个 pi 进程
-pi --extension /path/to/index.ts
+然后在 pi 中执行 `/reload`（或重启 pi）即可使用 `/plain`。
+
+### 临时加载单个 pi 进程
+
+```bash
+pi --extension /path/to/pi-plain/index.ts
 ```
 
 ## 测试
