@@ -1,0 +1,16 @@
+# 本机 pi 项目配置（含机器相关路径，勿提交）
+.pi/
+
+# 任务评审报告（本地人工审查产物）
+report/
+
+# 开发过程草稿
+progress-worker.md
+
+# E2E 临时会话目录
+e2e-*/
+
+# 通用
+node_modules/
+*.log
+.DS_Store

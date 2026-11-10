@@ -1,0 +1,25 @@
+{
+	"name": "pi-plain",
+	"version": "1.0.0",
+	"description": "pi 编码代理扩展：/plain 把当前会话渲染为无格式纯文本，鼠标拖拽选中即复制",
+	"type": "module",
+	"license": "MIT",
+	"repository": "github.com/chengeyouyou/pi-plain",
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"extension",
+		"plain-text",
+		"clipboard",
+		"copy"
+	],
+	"files": [
+		"index.ts"
+	],
+	"scripts": {
+		"test": "node test/run-tests.mjs"
+	},
+	"engines": {
+		"node": ">=18"
+	}
+}
