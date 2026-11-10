@@ -3,8 +3,19 @@
  *
  * 用法: node test/run-tests.mjs
  *
- * 单元测试：buildPlainLines / buildPlainHeader / writeTempFile
- *   （会话条目 → 纯文本行：无 ANSI、角色分隔、工具调用/结果、错误标记、系统消息跳过）
+ * 测试：
+ *  1. 单元: buildPlainLines / buildPlainHeader / writeTempFile
+ *     （会话条目 → 纯文本行：无 ANSI、角色分隔、工具调用/结果、错误标记）
+ *  2. 集成: 真实 TuiAltScreen + 假终端 + 生产忠实布局
+ *  3. 集成测试: 真实 TuiAltScreen + 假终端 + 生产忠实布局
+ *     复刻 chat-viewport.js 的真实树 (root → dock → editorContainer)，
+ *     像 pi 一样 editorContainer.addChild(dialog) 挂载，验证 index.ts 里
+ *     的 layoutRoot swap 修复后：
+ *     - dialog.sv.viewportHeight > 0（布局帧里存在 scroll 框）
+ *     - 屏幕可见 plain-line、不可见 transcript-line（dialog 占满全屏）
+ *     - 滚轮/键盘 g/G/PgUp/b 滚动 dialog 的 ScrollView（且 transcript 不动）
+ *     - 鼠标拖拽选择 → 松手自动复制（内容级锚点，字符级切片正确）
+ *     - q/Esc 关闭后 layoutRoot 恢复、focus 回到 editor
  */
 import { readFileSync, existsSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -129,6 +140,277 @@ rmSync(join(tmpFile, ".."), { recursive: true, force: true });
 
 // 空会话
 assert(buildPlainLines([]).join("") === "", "空会话 → 空输出");
+
+// ---------------------------------------------------------------------------
+// 2. 集成测试：真实 TuiAltScreen + 假终端 + 生产忠实布局
+// ---------------------------------------------------------------------------
+console.log("\n[2] 集成测试: TuiAltScreen + 生产嵌套布局 (滚轮 / 鼠标选择复制 / 键盘 / 关闭恢复)");
+
+const { TuiAltScreen } = jiti(join(PI_ROOT, "pi-tui/dist/tui-alt-screen.js"));
+const { VStack, ScrollView, Text, Container, isViewportTUI } = jiti(join(PI_ROOT, "pi-tui/dist/index.js"));
+const { getScrollViewBox } = jiti(join(PI_ROOT, "pi-tui/dist/layout.js"));
+
+const ROWS = 30;
+const COLS = 100;
+
+class FakeTerminal {
+	columns = COLS;
+	rows = ROWS;
+	kittyProtocolActive = false;
+	onInput = null;
+	onResize = null;
+	start(onInput, onResize) {
+		this.onInput = onInput;
+		this.onResize = onResize;
+	}
+	stop() {}
+	drainInput() {
+		return Promise.resolve();
+	}
+	write(data) {}
+	moveBy() {}
+	hideCursor() {}
+	showCursor() {}
+	clearLine() {}
+	clearFromCursor() {}
+	clearScreen() {}
+	setTitle() {}
+	setProgress() {}
+	setProgramStatus() {}
+	// 把输入喂给 TUI
+	feed(data) {
+		this.onInput(data);
+	}
+}
+
+const terminal = new FakeTerminal();
+const copyCalls = [];
+const tui = new TuiAltScreen(terminal, true, undefined, {
+	copyOnSelect: true,
+	copySelection: async (text) => {
+		copyCalls.push(text);
+		return true;
+	},
+});
+
+// --- 复刻 chat-viewport.js 的真实结构 ---
+const transcriptDoc = new Text(Array.from({ length: 50 }, (_, i) => `transcript-line-${i}`).join("\n"), 0, 0);
+const transcript = new ScrollView(transcriptDoc, { follow: "end", primary: true, overscroll: "chain", scrollbar: "auto" });
+const pending = new Container();
+const statusBar = new Container();
+const widgetsAbove = new Container();
+const widgetsBelow = new Container();
+const footer = new Container();
+const editor = new Text("editor placeholder", 1, 0);
+const editorContainer = new Container(); // ← pi: interactive-mode.js:422 new Container()（布局叶子）
+editorContainer.addChild(editor);
+const dock = new VStack([
+	{ component: pending, shrink: 1, minSize: 0 },
+	{ component: statusBar, shrink: 1, minSize: 0 },
+	{ component: widgetsAbove, shrink: 1, minSize: 0 },
+	{ component: editorContainer, shrink: 1, minSize: 3 }, // ← editor 槽位
+	{ component: widgetsBelow, shrink: 1, minSize: 0 },
+	{ component: footer, shrink: 1, minSize: 0 },
+]);
+const root = new VStack([
+	{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+	{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+]);
+
+// 基线: 无 dialog 时 transcript 正常布局（对应 pi mountInteractiveTui 已 setLayoutRoot）
+tui.setLayoutRoot(root);
+tui.setFocus(editor);
+tui.start();
+tui.renderNow(true);
+const previousRoot = tui.layoutRoot; // 生产中 = fullscreenLayoutRoot（即 root）
+assert(previousRoot === root, "基线: layoutRoot 已设为生产布局根");
+assert(!!getScrollViewBox(tui.currentLayout, transcript), "基线: transcript 在布局帧里有 scroll 框");
+
+// 长会话：单个助手消息含 200 行，保证可滚动
+const longEntries = [
+	{ type: "message", timestamp: now, message: { role: "user", content: "hi" } },
+	{ type: "message", timestamp: now, message: { role: "assistant", content: [{ type: "text", text: Array.from({ length: 200 }, (_, i) => `plain-line-${String(i).padStart(3, "0")}`).join("\n") }] } },
+];
+
+let doneCalled = 0;
+let dialog;
+let factoryLast; // 最近一次 fakeUi.custom 里 factory 返回的组件
+const themeLike = {
+	fg: (_token, text) => text,
+	bg: (_token, text) => text,
+	bold: (t) => t,
+	underline: (t) => t,
+	inverse: (t) => t,
+};
+
+// --- 模拟 pi 的 showExtensionCustom/showTopExtensionDialog 的真实挂载 ---
+const fakeUi = {
+	custom: async (factory) => {
+		// 像 pi 一样: 先调用 factory 拿到组件，再 pushExtensionDialog 挂进 editorContainer
+		const close = () => {
+			if (doneCalled > 0) return;
+			doneCalled++;
+			// 生产时序: factory 里 dialog 的 done 回调先恢复 layoutRoot，
+			// 随后 pi 的 done() → restoreEditor(): 恢复 editor + setFocus(editor)
+			const comp = factory.__lastComponent;
+			if (comp) {
+				editorContainer.clear();
+				editorContainer.addChild(editor);
+				tui.setFocus(editor);
+			}
+		};
+		const component = factory(tui, themeLike, { matches: () => false }, close);
+		factory.__lastComponent = component;
+		factoryLast = component;
+		editorContainer.clear();
+		editorContainer.addChild(component);
+		tui.setFocus(component);
+		return undefined;
+	},
+	notify: (msg) => {
+		notifications.push(msg);
+	},
+};
+const notifications = [];
+const fakeCtx = {
+	mode: "tui",
+	ui: fakeUi,
+	sessionManager: {
+		getBranch: () => longEntries,
+		getHeader: () => ({ id: "test-session", cwd: "/tmp/demo" }),
+	},
+	hasUI: true,
+};
+
+let registeredDef;
+await mod.default({
+	registerCommand: (name, def) => {
+		assert(name === "plain", "注册了 /plain 命令");
+		registeredDef = def;
+	},
+});
+assert(!!registeredDef, "命令 handler 已注册");
+
+// 运行命令 handler（工厂回调内执行 layoutRoot swap）
+await registeredDef.handler("", fakeCtx);
+// 从挂载树取 dialog（editorContainer 的当前子，模拟 showTopExtensionDialog 挂载结果）
+dialog = editorContainer.children[0];
+assert(!!dialog && dialog !== editor, "editorContainer 里挂载了对话框组件（而非 editor）");
+
+// 模拟 pi 挂载后的一次渲染帧
+tui.renderNow(true);
+
+// --- 断言 1: swap 生效 —— dialog 成为布局根，ScrollView 有真实 viewport ---
+assert(tui.layoutRoot === dialog, "layoutRoot 已 swap 为 dialog");
+const frame = tui.currentLayout;
+const svBox = getScrollViewBox(frame, dialog.children[0]);
+assert(!!svBox, "布局帧里 getScrollViewBox(frame, dialog.sv) 存在");
+assert(dialog.children[0].viewportHeight > 0, `dialog.sv.viewportHeight > 0 (实际 ${dialog.children[0].viewportHeight})`);
+
+// --- 断言 2: 屏幕可见 plain-line、不可见 transcript-line（dialog 占满全屏） ---
+const screenText = tui.getScreenLines().join("\n");
+assert(screenText.includes("plain-line-"), "屏幕上可见 plain-line（dialog 全屏）");
+assert(!screenText.includes("transcript-line-"), "屏幕上不可见 transcript-line（transcript 被替换）");
+
+// 取对话框里的 ScrollView（VStack.children[0]）
+const scroll = dialog.children[0];
+assert(scroll.constructor.name === "ScrollView", "对话框第一个子组件是 ScrollView");
+
+// 初始 follow:"end" → 滚动到底部
+const expectedMax = Math.max(0, 200 - scroll.viewportHeight);
+assert(scroll.scrollTop >= expectedMax - 1, `初始滚动到底部 (scrollTop=${scroll.scrollTop}, max=${expectedMax})`);
+
+// --- 滚轮测试（滚轮必须落在 dialog 的 ScrollView 上，而不是背后的 transcript） ---
+const beforeDown = scroll.scrollTop;
+const transcriptBeforeDown = transcript.scrollTop;
+terminal.feed("\x1b[<64;50;15M"); // 滚轮向上
+tui.renderNow(true);
+assert(scroll.scrollTop < beforeDown, `滚轮向上: ${beforeDown} → ${scroll.scrollTop}`);
+assert(transcript.scrollTop === transcriptBeforeDown, `滚轮没有落到背后 transcript (scrollTop 保持 ${transcript.scrollTop})`);
+
+const beforeUp = scroll.scrollTop;
+for (let i = 0; i < 5; i++) terminal.feed("\x1b[<65;50;15M");
+tui.renderNow(true);
+assert(scroll.scrollTop > beforeUp, `滚轮向下: ${beforeUp} → ${scroll.scrollTop}`);
+assert(transcript.scrollTop === transcriptBeforeDown, "滚轮向下后 transcript 仍未被滚动");
+
+// --- 键盘 g/G/PgUp/PgDn/b ---
+terminal.feed("g");
+tui.renderNow(true);
+assert(scroll.scrollTop === 0, `g 回到顶部 (scrollTop=${scroll.scrollTop})`);
+
+const beforePgDn = scroll.scrollTop;
+terminal.feed("\x1b[6~"); // PgDn
+tui.renderNow(true);
+assert(scroll.scrollTop > beforePgDn, `PgDn 向下: ${beforePgDn} → ${scroll.scrollTop}`);
+
+terminal.feed("G"); // shift+g
+tui.renderNow(true);
+assert(scroll.scrollTop >= expectedMax - 1, `G 到底部 (scrollTop=${scroll.scrollTop})`);
+
+// b = 半页向上（从底部验证）
+const beforeHalfB = scroll.scrollTop;
+terminal.feed("b");
+tui.renderNow(true);
+assert(scroll.scrollTop < beforeHalfB, `b 半页向上: ${beforeHalfB} → ${scroll.scrollTop}`);
+
+// --- 鼠标拖拽选择: 内容级锚点 + 松手复制字符级切片 ---
+terminal.feed("g");
+tui.renderNow(true);
+assert(scroll.scrollTop === 0, "重置到顶部");
+// 源文本布局: 0=标题 1=会话 2=提示 3=空 4=用户hdr 5=hi 6=空 7=助手hdr 8..=plain-line-000..
+// scrollTop=0 → 屏幕行 y = 内容行 y；在 (col 5, row 10) 按下 = 内容行 10 = plain-line-002，拖到 row 12
+terminal.feed("\x1b[<0;6;11M"); // press at col 5 (6-1), row 10 (11-1)
+terminal.feed("\x1b[<32;11;13M"); // drag to col 10, row 12
+terminal.feed("\x1b[<0;11;13m"); // release
+tui.renderNow(true);
+
+assert(!!tui.selectionAnchor, "拖拽后存在选择锚点");
+assert(tui.selectionAnchor?.scrollView === scroll, "选择锚点 scrollView === dialog 的 ScrollView（内容级选择）");
+assert(copyCalls.length === 1, `松手触发一次复制 (实际 ${copyCalls.length})`);
+if (copyCalls.length > 0) {
+	const copied = copyCalls[0];
+	const copiedLines = copied.split("\n");
+	assert(!copied.includes("\x1b"), "复制内容无 ANSI");
+	assert(copiedLines.length === 3, `选中 3 行 (实际 ${copiedLines.length})`);
+	// 中间行为完整行（Text 有 paddingX=1 前缀空格）
+	assert(copiedLines[1]?.trim() === "plain-line-003", `中间行是完整源行 plain-line-003 (got: ${JSON.stringify(copiedLines)})`);
+	// 首行从 col 5 开始 → 缺 "pla" 前缀；末行到 col 10 → 数字被截断（字符级切片正确）
+	assert(copiedLines[0]?.trim() === "n-line-002", `首行列切片正确 (got: ${JSON.stringify(copiedLines)})`);
+	assert(copiedLines[2]?.trim() === "plain-line", `末行列切片正确 (got: ${JSON.stringify(copiedLines)})`);
+}
+
+// 单点点击（无拖拽）不应复制
+copyCalls.length = 0;
+terminal.feed("\x1b[<0;6;15M");
+terminal.feed("\x1b[<0;6;15m");
+tui.renderNow(true);
+assert(copyCalls.length === 0, "单点点击不触发复制");
+
+// --- c = 复制全部 ---
+terminal.feed("c");
+// copyToClipboard 在真实环境走系统剪贴板；此处用原生 API 验证（Windows 走 wsl powershell）
+await new Promise((r) => setTimeout(r, 1500));
+tui.renderNow(true);
+const statusLine = dialog.children[1].text ?? "";
+console.log(`  状态行: ${JSON.stringify(statusLine)}`);
+assert(/剪贴板|失败/.test(statusLine), "c 后状态行显示复制结果");
+
+// --- w = 存文件 ---
+terminal.feed("w");
+tui.renderNow(true);
+const statusAfterW = dialog.children[1].text ?? "";
+assert(statusAfterW.includes("plain.txt"), `w 后状态行显示临时文件路径: ${JSON.stringify(statusAfterW)}`);
+
+// --- q = 关闭: layoutRoot 恢复为原 root，focus 回到 editor ---
+terminal.feed("q");
+assert(doneCalled === 1, "q 关闭对话框 (done 被调用)");
+assert(tui.layoutRoot === previousRoot, "layoutRoot 恢复为原 root");
+tui.renderNow(true);
+assert(!!getScrollViewBox(tui.currentLayout, transcript), "关闭后 currentLayout 里能找到 transcript 的 scroll 框");
+assert(tui.getFocusedComponent() === editor, "关闭后 focus 回到 editor");
+
+tui.stop();
 
 console.log(`\n结果: ${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

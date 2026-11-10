@@ -22,11 +22,13 @@ import { join } from "node:path";
 import { copyToClipboard, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	isKeyRelease,
+	isViewportTUI,
 	matchesKey,
 	ScrollView,
 	stripTerminalSequences,
 	Text,
 	VStack,
+	type Component,
 	type TUI,
 } from "@earendil-works/pi-tui";
 
@@ -359,7 +361,20 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				await ctx.ui.custom((tui, theme, _keybindings, done) => {
-					return new PlainTextDialog(text, tui, theme, done);
+					// 全屏模式的 tui 实现了 ViewportTUI：把 dialog 设为布局根，
+					// 其 ScrollView 才能成为布局帧里的真正滚动节点（否则挂在普通
+					// Container 里，viewport 恒为 0，滚轮/翻页/选择全部失效）。
+					const viewport = isViewportTUI(tui);
+					// layoutRoot 是 TuiAltScreen 私有字段，公开 API 无 getter，读一次保存
+					const previousRoot = viewport
+						? (tui as unknown as { layoutRoot?: Component }).layoutRoot
+						: undefined;
+					const dialog = new PlainTextDialog(text, tui, theme, () => {
+						if (viewport) tui.setLayoutRoot(previousRoot);
+						done();
+					});
+					if (viewport) tui.setLayoutRoot(dialog);
+					return dialog;
 				});
 			} catch (error) {
 				ctx.ui.notify(`打开纯文本视图失败: ${error instanceof Error ? error.message : String(error)}`, "error");
