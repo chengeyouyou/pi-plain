@@ -512,6 +512,20 @@ terminal.feed("q"); // 关 dialog2
 assert(doneCalled === 1, "T3: dialog2 的 done 被调用");
 assert(tui.layoutRoot === dialog1, "T3: 关 dialog2 后 layoutRoot 恢复为 dialog1");
 tui.renderNow(true);
+// T3: hook 链完整性 — dialog2 关闭后，resize 仍必须触发 dialog1 的 syncScrollSize
+// （若 restore 无条件清共享 hook 槽，dialog1 的 hook 会被破坏，resize 静默失效）
+const t3Scroll = dialog1.children[0];
+const t3vhBefore = t3Scroll.viewportHeight;
+terminal.rows = 40; // 30 → 40
+tui.requestRender();
+tui.renderNow(true);
+assert(
+	t3Scroll.viewportHeight > t3vhBefore,
+	`T3: 关 dialog2 后 resize 仍触发 dialog1 的 syncScrollSize (${t3vhBefore} → ${t3Scroll.viewportHeight})`
+);
+terminal.rows = ROWS;
+tui.requestRender();
+tui.renderNow(true);
 // close 闭包把 focus 还给 editor，重新聚焦 dialog1 以便第二次 q 生效
 doneCalled = 0;
 tui.setFocus(dialog1);

@@ -210,6 +210,11 @@ class PlainTextDialog extends VStack {
 	private lastRows: number | undefined;
 	/** resize 后延迟刷新状态行的定时器（等本帧布局完成后 viewportHeight 才更新） */
 	private statusTimer: ReturnType<typeof setTimeout> | undefined;
+	/** F3：本 dialog 安装前 tui.requestRender 的引用（每实例保存，堆叠时形成 hook 链） */
+	private prevRequestRender: ((force?: boolean) => void) | undefined;
+	/** F3：本 dialog 安装的 requestRender 包装（restore 时按身份判断，只还原自己装的） */
+	private requestRenderHook: ((force?: boolean) => void) | undefined;
+
 	constructor(text: string, tui: TUI, theme: Theme, done: DoneFn) {
 		super([]);
 		this.text = text;
@@ -249,15 +254,15 @@ class PlainTextDialog extends VStack {
 			// layoutRoot 是 TuiAltScreen 私有字段，公开 API 无 getter
 			this.previousRoot = (tui as unknown as { layoutRoot?: Component }).layoutRoot;
 			// F3：hook requestRender 检测终端 resize（pi 的 resize 监听器只调 tui.requestRender，
-			// 而布局根经 [LAYOUT_NODE] 结构测量，dialog 自己的 render() 每帧不会被调）
-			const tuiAny = tui as unknown as { __plainRequestRender?: (force?: boolean) => void };
-			if (!tuiAny.__plainRequestRender) {
-				tuiAny.__plainRequestRender = this.tui.requestRender.bind(this.tui);
-			}
-			this.tui.requestRender = (force?: boolean) => {
+			// 而布局根经 [LAYOUT_NODE] 结构测量，dialog 自己的 render() 每帧不会被调）。
+			// 每个 dialog 保存自己安装前的引用，restore 时只还原自己装的那层，
+			// 堆叠对话框（d1 未关时开 d2）下 hook 链 d2→d1→原始 逐级还原、互不破坏。
+			this.prevRequestRender = this.tui.requestRender.bind(this.tui);
+			this.requestRenderHook = (force?: boolean) => {
 				if (this.swapped) this.syncScrollSize();
-				return tuiAny.__plainRequestRender!(force);
+				return this.prevRequestRender!(force);
 			};
+			this.tui.requestRender = this.requestRenderHook;
 			tui.setLayoutRoot(this);
 			this.swapped = true;
 		}
@@ -266,12 +271,11 @@ class PlainTextDialog extends VStack {
 	/** 恢复原布局根；done() 与 dispose() 可能先后/单独调用，靠 swapped/restored 保证幂等。 */
 	restoreLayout(): void {
 		if (this.swapped && !this.restored && isViewportTUI(this.tui)) {
-			// F3：还原 requestRender 为原始函数并清除共享槽
-			const tuiAny = this.tui as unknown as { __plainRequestRender?: (force?: boolean) => void };
-			if (tuiAny.__plainRequestRender) {
-				this.tui.requestRender = tuiAny.__plainRequestRender;
-				tuiAny.__plainRequestRender = undefined;
+			// 只有当前活跃的仍是本 dialog 装的 hook 才还原（堆叠时上层可能已还原过）
+			if (this.tui.requestRender === this.requestRenderHook) {
+				this.tui.requestRender = this.prevRequestRender!;
 			}
+			this.requestRenderHook = undefined;
 			this.tui.setLayoutRoot(this.previousRoot);
 			this.restored = true;
 		}

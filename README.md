@@ -73,7 +73,7 @@ pi --extension /path/to/index.ts
 node test/run-tests.mjs
 ```
 
-94 项断言，覆盖：
+95 项断言，覆盖：
 1. 纯文本构建（无 ANSI、角色分隔、工具调用/结果、错误标记、系统消息跳过）
 2. 集成测试（真实 `TuiAltScreen` + 假终端 + 忠实生产布局）：复刻
    chat-viewport.js 的真实树（root → dock → editorContainer 叶子节点），
@@ -86,3 +86,5 @@ node test/run-tests.mjs
    done 后再 dispose 为 no-op、堆叠对话框 previousRoot 链、终端 resize 后
    viewportHeight 自适应（27→44）且状态行刷新、regular（非 ViewportTUI）
    模式降级为完整纯文本（不切布局根、c/q 仍可用）
+4. round-2 评审修复回归（1 项）：堆叠对话框下 resize hook 链完整性——
+   关 dialog2 后 resize 仍触发 dialog1 的 syncScrollSize（27→39）
