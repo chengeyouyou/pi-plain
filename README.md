@@ -54,10 +54,26 @@ transcript/编辑器/焦点随之复原。若不做这一步，对话框会被 p
 
 ## 安装
 
-### 从本仓库安装
+### pi install（推荐，pi 1.5+）
 
 ```bash
-# 全局（推荐，自动发现目录）
+# 全局
+pi install git:github.com/chengeyouyou/pi-plain
+
+# 项目级（写入 .pi/settings.json，信任项目后生效）
+pi install git:github.com/chengeyouyou/pi-plain --local
+```
+
+> 注意：URL 必须带 `git:` 前缀或直接给 https 形式
+>（`pi install https://github.com/chengeyouyou/pi-plain`）；
+> scp 形式 `git@github.com:...` 会被当成路径而失败。
+> 移除：`pi remove git:github.com/chengeyouyou/pi-plain`；
+> 更新：`pi update --extensions`。
+
+### 手动安装（任意 pi 版本）
+
+```bash
+# 全局（自动发现目录）
 mkdir -p ~/.pi/agent/extensions/plain
 git clone --depth 1 https://github.com/chengeyouyou/pi-plain /tmp/pi-plain
 cp /tmp/pi-plain/index.ts ~/.pi/agent/extensions/plain/index.ts
@@ -82,7 +98,7 @@ pi --extension /path/to/pi-plain/index.ts
 node test/run-tests.mjs
 ```
 
-95 项断言，覆盖：
+97 项断言，覆盖：
 1. 纯文本构建（无 ANSI、角色分隔、工具调用/结果、错误标记、系统消息跳过）
 2. 集成测试（真实 `TuiAltScreen` + 假终端 + 忠实生产布局）：复刻
    chat-viewport.js 的真实树（root → dock → editorContainer 叶子节点），

@@ -578,5 +578,17 @@ assert(t5Done === 1, "T5: q 关闭对话框 (done 被调用)");
 
 tui.stop();
 
+// ────────────────────────────────────────────────────────────────
+// [3] 包清单回归：pi install 只认 package.json 的 "pi" manifest 或
+//     extensions/ 约定子目录（package-manager.js collectPackageResources），
+//     包根 index.ts 兜底不适用于包。防止"装上了但 /plain 不注册"。
+// ────────────────────────────────────────────────────────────────
+{ const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+  const exts = pkg?.pi?.extensions;
+  assert(Array.isArray(exts) && exts.length > 0, "[3] package.json 声明 pi.extensions（pi install 包发现依赖它）");
+  for (const rel of exts ?? []) {
+    assert(existsSync(join(REPO_ROOT, rel)), `[3] pi.extensions 指向的文件存在: ${rel}`);
+  } }
+
 console.log(`\n结果: ${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
